@@ -681,15 +681,22 @@ cc_library(
     visibility = internal_visibility([":friends"]),
     deps = [
         ":pjrt_common",
+        ":pjrt_compiler_variant",
         "//xla/pjrt/proto:pjrt_build_stamp_proto_cc",
         "//xla/pjrt/proto:pjrt_value_type_proto_cc",
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/container:node_hash_map",
+        "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_protobuf//:protobuf_lite",
         "@com_google_protobuf//:timestamp_cc_proto",
@@ -714,9 +721,16 @@ cc_library(
     name = "pjrt_build_stamp_writer",
     srcs = ["pjrt_build_stamp_writer.cc"],
     hdrs = ["pjrt_build_stamp_writer.h"],
-    # Restricted to compiler build stamp factories. Add a package here only if
-    # it registers a build stamp factory.
-    visibility = [":__pkg__"],
+    # Restricted to compiler build stamp factories and the helpers they use. Add
+    # Google-internal packages to `pjrt/google:build_stamp_factories`, which is
+    # not exported, rather than here.
+    visibility = internal_visibility(
+        [
+            ":__pkg__",
+            "//xla/pjrt/google:build_stamp_factories",
+        ],
+        or_else = [":__pkg__"],
+    ),
     deps = [
         ":pjrt_build_stamp",
         ":pjrt_common",
@@ -768,13 +782,18 @@ xla_cc_test(
     srcs = ["pjrt_build_stamp_test.cc"],
     deps = [
         ":pjrt_build_stamp",
+        ":pjrt_common",
+        ":pjrt_compiler_variant",
         "//xla/pjrt/proto:pjrt_build_stamp_proto_cc",
         "//xla/tsl/util/proto:parse_text_proto",
         "//xla/tsl/util/proto:proto_matchers",
+        "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",

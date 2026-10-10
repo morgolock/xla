@@ -16,18 +16,25 @@ limitations under the License.
 #ifndef XLA_PJRT_PJRT_BUILD_STAMP_H_
 #define XLA_PJRT_PJRT_BUILD_STAMP_H_
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
 
 #include "absl/base/attributes.h"
+#include "absl/base/nullability.h"
+#include "absl/base/thread_annotations.h"
+#include "absl/container/node_hash_map.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "google/protobuf/timestamp.pb.h"
 #include "xla/pjrt/pjrt_common.h"
+#include "xla/pjrt/pjrt_compiler_variant.h"
 #include "xla/pjrt/proto/pjrt_build_stamp.pb.h"
 #include "xla/pjrt/proto/pjrt_value_type.pb.h"
 
@@ -159,6 +166,109 @@ absl::Status ValidateCompatibilityVersion(
 // Validates that `key` is non-empty and `value` has a value set.
 absl::Status ValidateAttribute(absl::string_view key,
                                const PjRtValueTypeProto& value);
+
+// A thread-safe registry of build stamp factories, keyed by platform and
+// compiler variant.
+//
+// The registry is append-only: a key can be registered at most once, and
+// registrations are never removed or replaced. A factory runs on the first
+// `GetBuildStamp()` for its key, and its stamp is memoized for the lifetime of
+// the registry. Errors are not memoized, so a factory that fails (e.g. on a
+// transient RPC error) runs again on the next lookup.
+class PjRtBuildStampRegistry {
+ public:
+  using Factory = absl::AnyInvocable<absl::StatusOr<PjRtBuildStamp>()>;
+
+  PjRtBuildStampRegistry() = default;
+
+  // Not copyable or movable.
+  PjRtBuildStampRegistry(const PjRtBuildStampRegistry&) = delete;
+  PjRtBuildStampRegistry& operator=(const PjRtBuildStampRegistry&) = delete;
+
+  // Returns the process-wide registry.
+  static PjRtBuildStampRegistry& Global();
+
+  // Registers `factory` for `(platform_id, LinkedCompilerVariantId())`.
+  // Returns `kAlreadyExists` if a factory is already registered for the key.
+  absl::Status RegisterBuildStampFactory(PjRtPlatformId platform_id,
+                                         Factory factory);
+
+  // Registers `factory` for `(platform_id, variant)`. Returns `kAlreadyExists`
+  // if a factory is already registered for the key.
+  //
+  // TODO(dannywlee): Investigate whether remote compiler registration should be
+  // prevented from registering LinkedCompilerVariantId(), or if linked metadata
+  // can be reused.
+  absl::Status RegisterBuildStampFactory(PjRtPlatformId platform_id,
+                                         PjRtCompilerVariant variant,
+                                         Factory factory);
+
+  // Returns the build stamp for `(platform_id, variant)`, running the factory
+  // until it succeeds once. Concurrent lookups of a key wait for a running
+  // factory rather than running it again. Returns `kNotFound` if no factory is
+  // registered for the key, or the error of the factory. The returned stamp is
+  // valid for the lifetime of the registry.
+  //
+  // A factory must not look up its own key, directly or transitively; doing so
+  // deadlocks.
+  absl::StatusOr<const PjRtBuildStamp* absl_nonnull> GetBuildStamp(
+      PjRtPlatformId platform_id,
+      PjRtCompilerVariant variant = LinkedCompilerVariantId())
+      ABSL_ATTRIBUTE_LIFETIME_BOUND;
+
+ private:
+  struct Key {
+    PjRtPlatformId platform_id;
+    PjRtCompilerVariant variant;
+
+    template <typename H>
+    friend H AbslHashValue(H h, const Key& key) {
+      return H::combine(std::move(h), key.platform_id, key.variant);
+    }
+
+    friend bool operator==(const Key& a, const Key& b) {
+      return a.platform_id == b.platform_id && a.variant == b.variant;
+    }
+  };
+
+  struct Entry {
+    explicit Entry(Factory factory) : factory(std::move(factory)) {}
+
+    // Held while the factory runs, so that it runs at most once at a time.
+    absl::Mutex mu;
+    // Reset once `stamp` is set, to release any state the factory captured.
+    Factory factory ABSL_GUARDED_BY(mu);
+    // Set by the first successful run of `factory`, and never changed after.
+    std::optional<PjRtBuildStamp> stamp ABSL_GUARDED_BY(mu);
+  };
+
+  absl::Mutex mu_;
+  // `node_hash_map` for pointer stability: `Entry` is not movable (because of
+  // `absl::Mutex`), `GetBuildStamp()` uses `Entry*` outside of `mu_`, and
+  // returns pointers into `Entry::stamp` that must survive rehashes.
+  absl::node_hash_map<Key, Entry> entries_ ABSL_GUARDED_BY(mu_);
+};
+
+// Registers `factory` in `PjRtBuildStampRegistry::Global()`. CHECK-fails if a
+// factory is already registered for the key. Intended to be called from static
+// initializers (e.g. `STATIC_INITIALIZER` or module initializers).
+void PjRtRegisterBuildStampFactory(PjRtPlatformId platform_id,
+                                   PjRtBuildStampRegistry::Factory factory);
+void PjRtRegisterBuildStampFactory(PjRtPlatformId platform_id,
+                                   PjRtCompilerVariant variant,
+                                   PjRtBuildStampRegistry::Factory factory);
+
+// Returns `PjRtBuildStampRegistry::Global().GetBuildStamp(...)`, with the same
+// errors.
+absl::StatusOr<const PjRtBuildStamp* absl_nonnull> PjRtGetBuildStamp(
+    PjRtPlatformId platform_id,
+    PjRtCompilerVariant variant = LinkedCompilerVariantId());
+
+// Returns the `full_source_hash()` of `PjRtGetBuildStamp(...)`, with the same
+// errors.
+absl::StatusOr<absl::string_view> PjRtGetBuildStampFullSourceHash(
+    PjRtPlatformId platform_id,
+    PjRtCompilerVariant variant = LinkedCompilerVariantId());
 
 }  // namespace xla
 

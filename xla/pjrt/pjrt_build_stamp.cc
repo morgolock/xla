@@ -18,22 +18,28 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
 
+#include "absl/base/no_destructor.h"
+#include "absl/base/nullability.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "google/protobuf/map.h"
 #include "google/protobuf/repeated_ptr_field.h"
 #include "google/protobuf/timestamp.pb.h"
 #include "tsl/platform/fingerprint.h"
 #include "xla/pjrt/pjrt_common.h"
+#include "xla/pjrt/pjrt_compiler_variant.h"
 #include "xla/pjrt/proto/pjrt_build_stamp.pb.h"
 #include "xla/pjrt/proto/pjrt_value_type.pb.h"
 
@@ -420,6 +426,85 @@ absl::StatusOr<absl::string_view> PjRtBuildStamp::GetStringAttribute(
       absl::StrCat("Attribute '", key, "' has type ",
                    PjRtValueTypeCaseName(it->second.value_case()),
                    ", not the requested type \"string\"."));
+}
+
+PjRtBuildStampRegistry& PjRtBuildStampRegistry::Global() {
+  static absl::NoDestructor<PjRtBuildStampRegistry> registry;
+  return *registry;
+}
+
+absl::Status PjRtBuildStampRegistry::RegisterBuildStampFactory(
+    PjRtPlatformId platform_id, Factory factory) {
+  return RegisterBuildStampFactory(platform_id, LinkedCompilerVariantId(),
+                                   std::move(factory));
+}
+
+absl::Status PjRtBuildStampRegistry::RegisterBuildStampFactory(
+    PjRtPlatformId platform_id, PjRtCompilerVariant variant, Factory factory) {
+  // TODO(dannywlee): Investigate whether remote compiler registration should be
+  // prevented from registering LinkedCompilerVariantId(), or if linked metadata
+  // can be reused.
+  absl::MutexLock lock(mu_);
+  auto [it, inserted] =
+      entries_.try_emplace(Key{platform_id, variant}, std::move(factory));
+  if (!inserted) {
+    return absl::AlreadyExistsError(absl::StrCat(
+        "Build stamp factory already registered for platform_id ", platform_id,
+        " and compiler variant '", CompilerVariantToString(variant), "'"));
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<const PjRtBuildStamp* absl_nonnull>
+PjRtBuildStampRegistry::GetBuildStamp(PjRtPlatformId platform_id,
+                                      PjRtCompilerVariant variant) {
+  Entry* entry = nullptr;
+  {
+    absl::MutexLock lock(mu_);
+    auto it = entries_.find(Key{platform_id, variant});
+    if (it == entries_.end()) {
+      return absl::NotFoundError(absl::StrCat(
+          "No registered build stamp factory for platform_id ", platform_id,
+          " and compiler variant '", CompilerVariantToString(variant), "'"));
+    }
+    entry = &it->second;
+  }
+
+  // Run the factory under the entry's lock only, so a slow factory doesn't
+  // block lookups or registrations of other keys.
+  absl::MutexLock entry_lock(entry->mu);
+  if (!entry->stamp.has_value()) {
+    // Errors are not memoized, so the next lookup runs the factory again.
+    ABSL_ASSIGN_OR_RETURN(PjRtBuildStamp stamp, entry->factory());
+    entry->stamp = std::move(stamp);
+    entry->factory = nullptr;
+  }
+  return &*entry->stamp;
+}
+
+void PjRtRegisterBuildStampFactory(PjRtPlatformId platform_id,
+                                   PjRtBuildStampRegistry::Factory factory) {
+  PjRtRegisterBuildStampFactory(platform_id, LinkedCompilerVariantId(),
+                                std::move(factory));
+}
+
+void PjRtRegisterBuildStampFactory(PjRtPlatformId platform_id,
+                                   PjRtCompilerVariant variant,
+                                   PjRtBuildStampRegistry::Factory factory) {
+  CHECK_OK(PjRtBuildStampRegistry::Global().RegisterBuildStampFactory(
+      platform_id, variant, std::move(factory)));
+}
+
+absl::StatusOr<const PjRtBuildStamp* absl_nonnull> PjRtGetBuildStamp(
+    PjRtPlatformId platform_id, PjRtCompilerVariant variant) {
+  return PjRtBuildStampRegistry::Global().GetBuildStamp(platform_id, variant);
+}
+
+absl::StatusOr<absl::string_view> PjRtGetBuildStampFullSourceHash(
+    PjRtPlatformId platform_id, PjRtCompilerVariant variant) {
+  ABSL_ASSIGN_OR_RETURN(const PjRtBuildStamp* stamp,
+                        PjRtGetBuildStamp(platform_id, variant));
+  return stamp->full_source_hash();
 }
 
 }  // namespace xla

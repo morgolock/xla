@@ -35,6 +35,19 @@ namespace xla {
 absl::StatusOr<std::vector<std::unique_ptr<HloModule>>> DecomposeHloModule(
     const HloModule& module, bool deduplicate_modules);
 
+// Extracts a complete main thread "sparsecore" async chain rooted at
+// `async_done` into a standalone HLO module.
+absl::StatusOr<std::unique_ptr<HloModule>>
+ExtractSparseCoreOffloadIntoNewModule(const HloInstruction& async_done);
+
+// Returns whether `module`'s entry root is an `async-done` on the `sparsecore`
+// execution thread.
+bool IsSparseCoreOffloadUnit(const HloModule& module);
+
+// Places entry parameter instructions before any other instructions in
+// the module's schedule.
+void ScheduleParametersFirst(HloModule* module);
+
 // Extracts an HLO instruction into a new HLO module replacing its operands
 // with parameter instructions.
 std::unique_ptr<HloModule> ExtractInstructionIntoNewModule(

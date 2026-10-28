@@ -5376,5 +5376,34 @@ ENTRY main {
   }
 }
 
+TEST_P(HloDataflowAnalysisTest, LateBoundAsyncStartWrappingDynamicUpdateSlice) {
+  constexpr absl::string_view kHlo = R"hlo(
+HloModule late_bound_async_dus
+
+dus_wrapped {
+  dst = f32[2,4]{1,0} parameter(0)
+  upd = f32[1,4]{1,0} parameter(1)
+  idx = s32[] parameter(2)
+  ROOT updated = f32[2,4]{1,0} dynamic-update-slice(dst, upd, idx, idx)
+}
+
+ENTRY main {
+  dst = f32[2,4]{1,0} parameter(0)
+  upd = f32[1,4]{1,0} parameter(1)
+  c0 = s32[] constant(0)
+  start = ((), (), (f32[2,4]{1,0})) async-start(), calls=dus_wrapped
+  update = ((f32[2,4]{1,0}, f32[1,4]{1,0}, s32[]), f32[2,4]{1,0}, (f32[2,4]{1,0})) async-update(start, dst, upd, c0)
+  ROOT done = f32[2,4]{1,0} async-done(update)
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(module_, ParseAndReturnVerifiedModule(kHlo));
+  bool ssa_form = GetParam();
+  const HloDataflowAnalysis& analysis = RunAnalysis(ssa_form);
+  const HloInstruction* updated = FindInstruction(module_.get(), "updated");
+  const HloInstruction* root = module_->entry_computation()->root_instruction();
+  EXPECT_THAT(HloValuesAt(root),
+              ElementsAre(&analysis.GetValueDefinedAt(updated)));
+}
+
 }  // namespace
 }  // namespace xla

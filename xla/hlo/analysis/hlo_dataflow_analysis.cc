@@ -983,7 +983,12 @@ bool HloDataflowAnalysis::UpdateAsyncStartValueSet(
     // AsyncStart forwards the async wrapped computation root values to element
     // {1} of its output.
     changed |= UpdateAsyncChainOutputValueSet(async_start);
-  } else if (HloInstruction::IsThreadIncluded(
+  } else if (async_start->operand_count() > 0 &&
+             ShapeUtil::IndexIsValid(async_start->shape(), {1}) &&
+             ShapeUtil::Compatible(
+                 async_start->operand(0)->shape(),
+                 ShapeUtil::GetSubshape(async_start->shape(), {1})) &&
+             HloInstruction::IsThreadIncluded(
                  async_start->async_execution_thread(), execution_threads_)) {
     const HloValueSet& operand_value_set = GetValueSet(async_start->operand(0));
     HloValueSet& value_set = GetMutableValueSet(async_start, {1});

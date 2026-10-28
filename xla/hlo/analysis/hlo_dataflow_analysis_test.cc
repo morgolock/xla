@@ -5376,5 +5376,32 @@ ENTRY main {
   }
 }
 
+TEST_P(HloDataflowAnalysisTest,
+       ZeroOperandAsyncStartWrappingDynamicUpdateSlice) {
+  constexpr absl::string_view kHlo = R"hlo(
+HloModule zero_operand_async_dus
+
+dus_wrapped {
+  dst = f32[2,4]{1,0} parameter(0)
+  upd = f32[1,4]{1,0} parameter(1)
+  c0 = s32[] constant(0)
+  ROOT updated = f32[2,4]{1,0} dynamic-update-slice(dst, upd, c0, c0)
+}, execution_thread="sparsecore"
+
+ENTRY main {
+  dst = f32[2,4]{1,0} parameter(0)
+  upd = f32[1,4]{1,0} parameter(1)
+  start = ((), (), (f32[2,4]{1,0})) async-start(), async_execution_thread="sparsecore", calls=dus_wrapped
+  update = ((f32[2,4]{1,0}, f32[1,4]{1,0}), f32[2,4]{1,0}, (f32[2,4]{1,0})) async-update(start, dst, upd)
+  ROOT done = f32[2,4]{1,0} async-done(update)
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(module_, ParseAndReturnVerifiedModule(kHlo));
+  bool ssa_form = GetParam();
+  const HloDataflowAnalysis& analysis = RunAnalysis(ssa_form);
+  const HloInstruction* root = module_->entry_computation()->root_instruction();
+  EXPECT_FALSE(analysis.GetValueSet(root).values().empty());
+}
+
 }  // namespace
 }  // namespace xla

@@ -941,6 +941,9 @@ absl::StatusOr<Literal> RunModule(std::unique_ptr<HloModule> module,
                                   const RunModuleOptions& options) {
   if (!options.run_hlo_passes && !module->has_schedule()) {
     ABSL_RETURN_IF_ERROR(HloTrivialScheduler().Run(module.get()).status());
+    if (IsSparseCoreOffloadUnit(*module)) {
+      ScheduleParametersFirst(module.get());
+    }
   }
 
   absl::FlagSaver flag_saver;
@@ -1373,6 +1376,22 @@ absl::StatusOr<std::vector<HloIsolationTestResult>> RunIsolationPipeline(
         continue;
       }
       filtered_module_index++;
+    }
+
+    if (IsSparseCoreModule(*module)) {
+      if (std::optional<std::string> reason =
+              SparseCoreOffloadSkipReason(*module);
+          reason.has_value()) {
+        LOG(INFO) << "SparseCore module " << module->name()
+                  << " skipped: " << *reason;
+        HloIsolationTestResult skipped_result;
+        skipped_result.set_module_name(module->name());
+        skipped_result.set_state(State::SKIPPED);
+        skipped_result.set_reason(*reason);
+        pipeline_results.push_back(std::move(skipped_result));
+        WriteResults(pipeline_results);
+        continue;
+      }
     }
 
     // Execute module

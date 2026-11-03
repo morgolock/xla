@@ -81,8 +81,8 @@ struct PjRtLoadedExecutableDispatchInfo {
 // Helper for extracting parameter shapes from GetParameterShapes.
 std::vector<Shape> GetParameterShapes(const ComputationLayout& layout);
 
-// Clears the prefix of `parameter_shapes` that a `PadRealToStatic` in the entry
-// computation reads; fails unless that pad is the parameter's only reader.
+// Clears the prefix of `parameter_shapes` that a `PadRealToStatic` reads
+// (including across offloaded calls); fails if the parameter has other readers.
 absl::Status ClearPadRealToStaticParameterMetadataPrefixes(
     const HloModule& hlo_module, absl::Span<Shape> parameter_shapes);
 

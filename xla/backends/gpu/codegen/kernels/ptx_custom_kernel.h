@@ -51,7 +51,8 @@ absl::StatusOr<CustomKernel> GetOwnedPtxCustomKernel(
 absl::StatusOr<CustomKernel> CreateOwnedCubinCustomKernel(
     std::string kernel_name, std::vector<uint8_t> cubin, int num_args,
     se::BlockDim block_dim, se::ThreadDim thread_dim,
-    size_t shared_memory_bytes);
+    size_t shared_memory_bytes,
+    std::optional<se::ClusterDim> cluster_dim = std::nullopt);
 
 // Like CreateOwnedCubinCustomKernel, but the CUBIN buffer is shared instead of
 // copied. Prefer this whenever the CUBIN is already held in a reference counted

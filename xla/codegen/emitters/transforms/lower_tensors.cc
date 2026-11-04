@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/numeric/bits.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "google/protobuf/text_format.h"
 #include "llvm/ADT/APInt.h"
@@ -42,6 +43,7 @@ limitations under the License.
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialectDecl.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -80,7 +82,6 @@ limitations under the License.
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/rocm/rocm_compute_capability.h"
 #include "xla/util.h"
-#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace emitters {
@@ -184,13 +185,19 @@ std::optional<int> GetAlignmentFromArg(Value addr, ValueRange indices) {
 
   // Try to get the alignment from the function signature.
   auto base = mlir::dyn_cast<mlir::BlockArgument>(addr);
-  if (!base) return std::nullopt;
+  if (!base) {
+    return std::nullopt;
+  }
   auto func =
       mlir::dyn_cast<mlir::func::FuncOp>(base.getOwner()->getParentOp());
-  if (!func) return std::nullopt;
+  if (!func) {
+    return std::nullopt;
+  }
   auto align_attr =
       func.getArgAttr(base.getArgNumber(), ml::LLVMDialect::getAlignAttrName());
-  if (!align_attr) return std::nullopt;
+  if (!align_attr) {
+    return std::nullopt;
+  }
   int64_t base_align =
       mlir::cast<mlir::IntegerAttr>(align_attr).getValue().getSExtValue();
   if (base_align <= 0) {
@@ -375,7 +382,9 @@ struct RewriteFor : public OpRewritePattern<scf::ForOp> {
     rewriter.setInsertionPoint(new_terminator);
     for (auto [index, yielded_value] :
          llvm::enumerate(new_terminator.getResults())) {
-      if (inits_to_remove.test(index)) continue;
+      if (inits_to_remove.test(index)) {
+        continue;
+      }
       new_yielded_values.push_back(yielded_value);
     }
     rewriter.replaceOpWithNewOp<scf::YieldOp>(new_terminator,
@@ -435,8 +444,11 @@ std::tuple<Value, Value> GetSubByteIndex(Value linear_index, int bit_width,
   return {i8_index, sub_byte_shift};
 }
 
+constexpr absl::string_view kDsmemAttr = "xla_gpu.dsmem";
+
 ml::GEPOp CreateGep(TypedValue<mlir::RankedTensorType> tensor,
-                    Value linear_index, mlir::ImplicitLocOpBuilder& b) {
+                    Value linear_index, mlir::ImplicitLocOpBuilder& b,
+                    bool is_dsmem = false) {
   mlir::RankedTensorType tensor_type = tensor.getType();
   Type element_type = tensor_type.getElementType();
   int64_t num_elements = tensor_type.getNumElements();
@@ -447,8 +459,19 @@ ml::GEPOp CreateGep(TypedValue<mlir::RankedTensorType> tensor,
     num_elements = CeilOfRatio<int64_t>(num_elements, 8 / *sub_byte_width);
   }
   auto ptr = ml::LLVMPointerType::get(b.getContext());
-  auto tensor_ptr =
+  Value tensor_ptr =
       UnrealizedConversionCastOp::create(b, ptr, tensor).getResult(0);
+  if (is_dsmem) {
+    Value num_elems_val = mlir::arith::ConstantIntOp::create(
+        b, linear_index.getType(), num_elements);
+    Value cta_rank =
+        mlir::arith::DivUIOp::create(b, linear_index, num_elems_val);
+    if (cta_rank.getType() != b.getI32Type()) {
+      cta_rank = mlir::arith::TruncIOp::create(b, b.getI32Type(), cta_rank);
+    }
+    linear_index = mlir::arith::RemUIOp::create(b, linear_index, num_elems_val);
+    tensor_ptr = mlir::NVVM::MapaOp::create(b, ptr, tensor_ptr, cta_rank);
+  }
   mlir::LLVMTypeConverter converter(b.getContext());
   auto llvm_element_type = converter.convertType(element_type);
   auto array_type =
@@ -461,8 +484,9 @@ ml::GEPOp CreateGep(TypedValue<mlir::RankedTensorType> tensor,
 }
 
 ml::GEPOp CreateGep(TypedValue<mlir::RankedTensorType> tensor,
-                    ValueRange indices, mlir::ImplicitLocOpBuilder& b) {
-  return CreateGep(tensor, GetLinearIndex(indices, b), b);
+                    ValueRange indices, mlir::ImplicitLocOpBuilder& b,
+                    bool is_dsmem = false) {
+  return CreateGep(tensor, GetLinearIndex(indices, b), b, is_dsmem);
 }
 
 struct RewriteTensorExtract : OpRewritePattern<mlir::tensor::ExtractOp> {
@@ -481,7 +505,8 @@ struct RewriteTensorExtract : OpRewritePattern<mlir::tensor::ExtractOp> {
           GetSubByteIndex(linear_index, *sub_byte_width, b);
     }
 
-    auto gep = CreateGep(op.getTensor(), linear_index, b);
+    auto gep =
+        CreateGep(op.getTensor(), linear_index, b, op->hasAttr(kDsmemAttr));
     Type llvm_type =
         mlir::dyn_cast<ml::LLVMArrayType>(gep.getElemType()).getElementType();
     auto load_op = ml::LoadOp::create(rewriter, gep.getLoc(), llvm_type, gep);
@@ -601,7 +626,8 @@ class RewriteTensorInsert : public OpRewritePattern<mlir::tensor::InsertOp> {
       if (device_spec_.IsCpu()) {
         // On CPU, workgroup tiles are byte-aligned (see `GetWorkDimensions`),
         // so distinct threads never access the same byte.
-        auto gep = CreateGep(tensor_dest, linear_index, b);
+        auto gep =
+            CreateGep(tensor_dest, linear_index, b, op->hasAttr(kDsmemAttr));
         Value current_value = ml::LoadOp::create(b, ty, gep);
         Value masked_out_current_value =
             mlir::arith::AndIOp::create(b, current_value, inverse_mask);
@@ -621,12 +647,17 @@ class RewriteTensorInsert : public OpRewritePattern<mlir::tensor::InsertOp> {
         // We need to use directly op.getDest() as input, otherwise the
         // following rewrite might remove the only user of it.
         tensor_dest = op.getDest();
+        bool is_dsmem = op->hasAttr(kDsmemAttr);
         // Technically we should halve the number of elements when going to i8
-        // element type, but it doesn't really matter because we only actually
-        // use the element type. Indexing is done by linear index, and GEP ops
-        // don't care about the number of elements. The tensor types will
-        // disappear completely after the LowerTensors pass.
-        Type tensor_ty = tensor_dest.getType().clone(ty);
+        // element type, but it doesn't really matter unless DSMEM is used,
+        // where CreateGep splits linear_index by the per-CTA element count.
+        Type tensor_ty = is_dsmem
+                             ? tensor_dest.getType().clone(
+                                   {CeilOfRatio<int64_t>(
+                                       tensor_dest.getType().getNumElements(),
+                                       8 / *sub_byte_width)},
+                                   ty)
+                             : tensor_dest.getType().clone(ty);
         auto tensor_dest_i8 =
             UnrealizedConversionCastOp::create(b, tensor_ty, tensor_dest)
                 .getResult(0);
@@ -634,6 +665,9 @@ class RewriteTensorInsert : public OpRewritePattern<mlir::tensor::InsertOp> {
         // We need AtomicRMWOp because it can happen that different threads try
         // to access the same memory location.
         auto atomic_rmw = AtomicRMWOp::create(b, tensor_dest_i8, linear_index);
+        if (is_dsmem) {
+          atomic_rmw->setAttr(kDsmemAttr, b.getUnitAttr());
+        }
         mlir::ImplicitLocOpBuilder body_builder(atomic_rmw.getLoc(),
                                                 atomic_rmw.getBodyBuilder());
         Value current_value = atomic_rmw.getCurrentValue();
@@ -649,7 +683,8 @@ class RewriteTensorInsert : public OpRewritePattern<mlir::tensor::InsertOp> {
         op.replaceAllUsesWith(casted_result);
       }
     } else {
-      auto gep = CreateGep(tensor_dest, linear_index, b);
+      auto gep =
+          CreateGep(tensor_dest, linear_index, b, op->hasAttr(kDsmemAttr));
       mlir::LLVMTypeConverter converter(getContext());
       auto llvm_type = converter.convertType(scalar_value.getType());
       scalar_value =
@@ -916,8 +951,7 @@ ml::GlobalOp CreateGlobalOp(mlir::Attribute value,
       auto unpacked_data =
           mlir::cast<mlir::DenseElementsAttr>(value).getRawData();
       std::vector<char> packed_data(num_elements);
-      absl::Span<char> packed_data_span =
-          absl::MakeSpan(packed_data.data(), packed_data.size());
+      absl::Span<char> packed_data_span = absl::MakeSpan(packed_data);
       PackIntN(4, unpacked_data, packed_data_span);
       value = mlir::DenseElementsAttr::getFromRawBuffer(
           mlir::RankedTensorType::get({num_elements}, llvm_element_type),
@@ -1024,7 +1058,8 @@ struct RewriteSyncThreads : OpRewritePattern<gpu::SyncThreadsOp> {
 
   LogicalResult matchAndRewrite(
       gpu::SyncThreadsOp op, mlir::PatternRewriter& rewriter) const override {
-    mlir::gpu::BarrierOp::create(rewriter, op.getLoc());
+    auto barrier = mlir::gpu::BarrierOp::create(rewriter, op.getLoc());
+    barrier.setScope(op.getScope());
     rewriter.replaceOp(op, op.getOperands());
     return success();
   }
@@ -1056,14 +1091,6 @@ struct RemoveUnusedIndexSwitchResults : OpRewritePattern<scf::IndexSwitchOp> {
     return success();
   }
 };
-
-bool IsAtomicIntegral(Type element_type) {
-  if (!element_type.isInteger()) {
-    return false;
-  }
-  unsigned element_bitwidth = element_type.getIntOrFloatBitWidth();
-  return element_bitwidth == 32 || element_bitwidth == 64;
-}
 
 Value CreateBitcast(mlir::ImplicitLocOpBuilder& b, mlir::Operation* op,
                     Value value, Type ty) {
@@ -1147,7 +1174,8 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
     Location loc = op.getLoc();
     auto sync_scope = determinateScope();
     mlir::ImplicitLocOpBuilder b(loc, rewriter);
-    Value addr = CreateGep(op.getInput(), op.getIndices(), b);
+    Value addr =
+        CreateGep(op.getInput(), op.getIndices(), b, op->hasAttr(kDsmemAttr));
 
     switch (atomic_bin_op) {
       case ml::AtomicBinOp::xchg: {
@@ -1512,7 +1540,7 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
       std::tie(linear_index, sub_byte_shift) =
           GetSubByteIndex(linear_index, *sub_byte_bit_width, b);
     }
-    Value addr = CreateGep(input, linear_index, b);
+    Value addr = CreateGep(input, linear_index, b, op->hasAttr(kDsmemAttr));
     Value shift, mask;
     if (small_type) {
       if (min_atomic_size > 8) {
@@ -1613,7 +1641,7 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
           Value not_ok = ml::XOrOp::create(b, ok, low_bit);
           scf::ConditionOp::create(b, not_ok, ValueRange{next});
         },
-        [&](mlir::OpBuilder& b, Location loc, ValueRange values) {
+        [](mlir::OpBuilder& b, Location loc, ValueRange values) {
           scf::YieldOp::create(b, loc, values);
         });
   }

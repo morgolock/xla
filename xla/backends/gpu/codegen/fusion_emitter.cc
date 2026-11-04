@@ -43,19 +43,14 @@ limitations under the License.
 #include "llvm/Support/Casting.h"
 #include "llvm/TargetParser/Triple.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/IR/MLIRContext.h"
-#include "xla/codegen/emitters/kernel_api_builder.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
-#include "xla/hlo/analysis/indexing_map.h"
-#include "xla/runtime/work_dimensions.h"
-#include "xla/service/gpu/ir_emitter_context.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/gpu/target_util.h"
 #include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/shape.h"
 #include "xla/status_macros.h"
 #include "xla/stream_executor/device_description.h"
-#include "xla/tsl/platform/errors.h"
+#include "xla/stream_executor/launch_dim.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla {
@@ -147,8 +142,12 @@ absl::Status AnnotateKernelLaunchDimensions(
                      launch_dims.thread_counts_per_block().y, ",",
                      launch_dims.thread_counts_per_block().z);
     kernel->addFnAttr("nvvm.reqntid", attr);
-    // Maybe we want to set "reqnctapercluster" here, but not sure if needed or
-    // if LLVM supports that yet. Let's do that later when needed.
+    if (launch_dims.cluster_dims().has_value()) {
+      const std::string cluster_attr = absl::StrCat(
+          launch_dims.cluster_dims()->x, ",", launch_dims.cluster_dims()->y,
+          ",", launch_dims.cluster_dims()->z);
+      kernel->addFnAttr("nvvm.cluster_dim", cluster_attr);
+    }
   } else if (target_triple.getArch() == llvm::Triple::amdgpu) {
     kernel->addFnAttr("amdgpu-flat-work-group-size",
                       absl::StrJoin({launch_dims.num_threads_per_block(),

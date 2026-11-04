@@ -45,8 +45,10 @@ limitations under the License.
 #include "xla/codegen/xtile/block_level_parameters.h"
 #include "xla/future.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/service/gpu/launch_dimensions.h"
 #include "xla/status_macros.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/launch_dim.h"
 #include "xla/util.h"
 
 namespace xla::gpu {
@@ -159,8 +161,13 @@ CubinCustomKernelCompiler::CompileMlirToCubinImpl(
   // Return `borrowed_context` to the pool before LLVM/PTX compilation so
   // concurrent emitters can reuse it without allocating fresh contexts.
   borrowed_context.reset();
+  LaunchDimensions launch_dimensions(
+      spec.launch_dimensions().block_counts(),
+      spec.launch_dimensions().thread_counts_per_block(),
+      spec.cluster_dim().has_value() ? spec.cluster_dim()
+                                     : spec.launch_dimensions().cluster_dims());
   ABSL_RETURN_IF_ERROR(AnnotateMlirKernelLlvmModule(
-      device_info_, spec.launch_dimensions(), spec.name(), data_layout_,
+      device_info_, launch_dimensions, spec.name(), data_layout_,
       target_triple_, llvm_source.module()));
   return CompileToCubinImpl(std::move(llvm_source));
 }
@@ -176,13 +183,17 @@ absl::StatusOr<std::unique_ptr<Thunk>> CubinCustomKernelCompiler::CompileImpl(
                              std::move(borrowed_context), hlo_module,
                              unroll_factor));
 
+  const LaunchDimensions& launch_dimensions = spec.launch_dimensions();
+  std::optional<se::ClusterDim> cluster_dim =
+      spec.cluster_dim().has_value() ? spec.cluster_dim()
+                                     : launch_dimensions.cluster_dims();
   ABSL_ASSIGN_OR_RETURN(CustomKernel custom_kernel,
                         kernel::CreateOwnedCubinCustomKernel(
                             std::string(spec.name()), std::move(cubin),
                             spec.kernel_arguments().args().size(),
-                            spec.launch_dimensions().block_counts(),
-                            spec.launch_dimensions().thread_counts_per_block(),
-                            spec.scratch_bytes().value_or(0)));
+                            launch_dimensions.block_counts(),
+                            launch_dimensions.thread_counts_per_block(),
+                            spec.scratch_bytes().value_or(0), cluster_dim));
 
   return std::make_unique<CustomKernelThunk>(
       std::move(thunk_info), std::move(custom_kernel), spec.kernel_arguments(),

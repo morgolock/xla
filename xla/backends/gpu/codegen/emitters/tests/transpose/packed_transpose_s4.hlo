@@ -10,3 +10,9 @@ fusion {
 // CHECK: #indexing_map{{.*}}domain:{{.*}}th_x in [0, [[N_THREADS:[0-9]+]]]
 // CHECK: %thread_id_x = gpu.thread_id  x {xla.range = [0 : index, [[N_THREADS]] : index]}
 // CHECK: xla_gpu.allocate_shared : tensor<256x256xi4>
+// CHECK: vector.bitcast {{.*}} : vector<8xi4> to vector<1xi32>
+// CHECK: arith.andi {{.*}} : i32
+// CHECK: arith.shli {{.*}} : i32
+// CHECK: arith.ori {{.*}} : i32
+// CHECK: arith.shrui {{.*}} : i32
+// CHECK: vector.bitcast {{.*}} : vector<1xi32> to vector<8xi4>

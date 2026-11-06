@@ -23,6 +23,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/base/casts.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
@@ -69,6 +70,12 @@ namespace xla {
 namespace gpu {
 
 namespace {
+
+// Sub-25us kernels suffer from single-shot CUDA event timer jitter (32ns PTIMER
+// quantization plus launch/clock variance). Repeat-sampling back-to-back and
+// taking the median stabilizes backend selection without cold-cache overhead.
+constexpr int64_t kShortKernelThresholdNs = 25'000;
+constexpr int kShortKernelTimedRuns = 9;
 
 std::vector<ExecutionInput> CreateExecutionInputsFromBuffers(
     absl::Span<se::DeviceAddressBase const> buffers,
@@ -336,7 +343,28 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(
       ExecutionOutput execution_output,
       Execute(executable, std::move(execution_inputs), &profile, allocator_));
 
-  result.duration = absl::Nanoseconds(profile.compute_time_ns());
+  int64_t duration_ns = profile.compute_time_ns();
+  if (duration_ns > 0 && duration_ns < kShortKernelThresholdNs) {
+    std::vector<int64_t> durations_ns;
+    durations_ns.reserve(kShortKernelTimedRuns);
+    durations_ns.push_back(duration_ns);
+    ExecutionProfile repeat_profile;
+    for (int run = 1; run < kShortKernelTimedRuns; ++run) {
+      repeat_profile.Clear();
+      repeat_profile.set_warmup_run_executed(true);
+      std::vector<ExecutionInput> repeat_inputs =
+          CreateExecutionInputsFromBuffers(rz_buffers.input_buffers(),
+                                           rz_buffers.input_shapes());
+      ABSL_RETURN_IF_ERROR(Execute(executable, std::move(repeat_inputs),
+                                   &repeat_profile, allocator_)
+                               .status());
+      durations_ns.push_back(repeat_profile.compute_time_ns());
+    }
+    absl::c_sort(durations_ns);
+    duration_ns = durations_ns[durations_ns.size() / 2];
+  }
+
+  result.duration = absl::Nanoseconds(duration_ns);
   result.output_buffer = execution_output.Commit().ConsumeResult();
   return result;
 }

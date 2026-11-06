@@ -12,9 +12,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -72,6 +76,8 @@ limitations under the License.
 #include "xla/codegen/emitters/kernel_api_builder.h"
 #include "xla/codegen/emitters/transforms/atomic_rmw_utils.h"
 #include "xla/codegen/emitters/transforms/passes.h"
+#include "xla/hlo/analysis/symbolic_expr.h"
+#include "xla/hlo/analysis/symbolic_map.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_description.pb.h"
@@ -110,57 +116,43 @@ namespace scf = ::mlir::scf;
 namespace ml = ::mlir::LLVM;
 namespace vector = ::mlir::vector;
 
+Value UnwrapPassThroughBufferOp(Operation* def, unsigned result_number) {
+  if (auto insert = mlir::dyn_cast<mlir::tensor::InsertOp>(def)) {
+    return insert.getDest();
+  }
+  if (auto copy_slice = mlir::dyn_cast<CopySliceOp>(def)) {
+    return copy_slice.getDest();
+  }
+  if (auto transfer_write = mlir::dyn_cast<vector::TransferWriteOp>(def)) {
+    return transfer_write.getBase();
+  }
+  if (auto sync_threads = mlir::dyn_cast<gpu::SyncThreadsOp>(def)) {
+    return sync_threads.getOperand(result_number);
+  }
+  if (auto scf_for = mlir::dyn_cast<scf::ForOp>(def)) {
+    return scf_for.getInitArgs()[result_number];
+  }
+  return nullptr;
+}
+
 Value GetDestinationBuffer(Value dest) {
-  while (dest.getDefiningOp()) {
-    int result_number = mlir::cast<OpResult>(dest).getResultNumber();
-    if (auto insert = dest.getDefiningOp<mlir::tensor::InsertOp>()) {
-      dest = insert.getDest();
-    } else if (auto copy_slice = dest.getDefiningOp<CopySliceOp>()) {
-      dest = copy_slice.getDest();
-    } else if (auto scf_if = dest.getDefiningOp<scf::IfOp>()) {
+  while (Operation* def = dest.getDefiningOp()) {
+    unsigned result_number = mlir::cast<OpResult>(dest).getResultNumber();
+    if (Value unwrapped = UnwrapPassThroughBufferOp(def, result_number)) {
+      dest = unwrapped;
+    } else if (auto scf_if = mlir::dyn_cast<scf::IfOp>(def)) {
       // Pick one of the branches, they're required to yield the same buffers.
       dest = scf_if.getThenRegion().front().getTerminator()->getOperand(
           result_number);
-    } else if (auto scf_for = dest.getDefiningOp<scf::ForOp>()) {
-      dest = scf_for.getInitArgs()[result_number];
-    } else if (auto sync_threads = dest.getDefiningOp<gpu::SyncThreadsOp>()) {
-      dest = sync_threads.getOperand(result_number);
-    } else if (dest.getDefiningOp<UnrealizedConversionCastOp>() ||
-               dest.getDefiningOp<gpu::AllocateSharedOp>()) {
+    } else if (mlir::isa<UnrealizedConversionCastOp, gpu::AllocateSharedOp>(
+                   def)) {
       break;
-    } else if (auto transfer_write =
-                   dest.getDefiningOp<vector::TransferWriteOp>()) {
-      dest = transfer_write.getBase();
     } else {
-      dest.getDefiningOp()->emitOpError("unsupported dest type");
+      def->emitOpError("unsupported dest type");
       return nullptr;
     }
   }
   return dest;
-}
-
-std::optional<int> GetAlignmentFromArg(Value addr, ValueRange indices) {
-  CHECK_LE(indices.size(), 1) << "Only 0D and 1D tensors are supported";
-
-  // If the offset isn't empty or {0}, we don't return any alignment because
-  // computing it isn't trivial and it's unclear that we need to deal with that
-  // case in practice.
-  auto effective_offset_is_zero = [](ValueRange offsets) -> bool {
-    if (offsets.empty()) return true;
-    return mlir::matchPattern(offsets[0].getDefiningOp(), mlir::m_Zero());
-  };
-  if (!effective_offset_is_zero(indices)) return std::nullopt;
-
-  // Try to get the alignment from the function signature.
-  auto base = mlir::dyn_cast<mlir::BlockArgument>(addr);
-  if (!base) return std::nullopt;
-  auto func =
-      mlir::dyn_cast<mlir::func::FuncOp>(base.getOwner()->getParentOp());
-  if (!func) return std::nullopt;
-  auto align_attr =
-      func.getArgAttr(base.getArgNumber(), ml::LLVMDialect::getAlignAttrName());
-  if (!align_attr) return std::nullopt;
-  return mlir::cast<mlir::IntegerAttr>(align_attr).getValue().getSExtValue();
 }
 
 template <typename Op>
@@ -351,6 +343,293 @@ std::optional<int> GetSubByteBitWidth(Type element_type) {
   return std::nullopt;
 }
 
+constexpr int kGPUSharedMemoryAddrSpace = 3;
+
+// Traces a tensor SSA value back to its underlying allocation or function
+// parameter to determine its base pointer byte alignment, if known.
+std::optional<uint64_t> GetBaseBufferAlignment(Value base, Type element_type,
+                                               Operation* op,
+                                               int branch_depth = 0) {
+  auto get_shared_mem_alignment = [&]() -> uint64_t {
+    if (element_type.isIntOrFloat() &&
+        element_type.getIntOrFloatBitWidth() < 32) {
+      return uint64_t{4};
+    }
+    mlir::LLVMTypeConverter converter(op->getContext());
+    Type llvm_elem_type = converter.convertType(element_type);
+    return mlir::DataLayout::closest(op).getTypeABIAlignment(llvm_elem_type);
+  };
+
+  for (int depth = 0; base && depth < 4096; ++depth) {
+    if (auto block_arg = mlir::dyn_cast<mlir::BlockArgument>(base)) {
+      Operation* parent_op = block_arg.getOwner()->getParentOp();
+      if (auto func = mlir::dyn_cast_or_null<mlir::func::FuncOp>(parent_op);
+          func && block_arg.getOwner()->isEntryBlock()) {
+        mlir::Attribute align_attr = func.getArgAttr(
+            block_arg.getArgNumber(), ml::LLVMDialect::getAlignAttrName());
+        if (!align_attr) {
+          return std::nullopt;
+        }
+        int64_t align =
+            mlir::cast<mlir::IntegerAttr>(align_attr).getValue().getSExtValue();
+        if (align <= 0) {
+          return std::nullopt;
+        }
+        return static_cast<uint64_t>(align);
+      }
+      if (auto scf_for = mlir::dyn_cast_or_null<scf::ForOp>(parent_op)) {
+        unsigned arg_num = block_arg.getArgNumber();
+        unsigned num_ivs = scf_for.getNumInductionVars();
+        if (arg_num < num_ivs) {
+          return std::nullopt;
+        }
+        base = scf_for.getInitArgs()[arg_num - num_ivs];
+        continue;
+      }
+      return std::nullopt;
+    }
+
+    Operation* def = base.getDefiningOp();
+    if (!def) {
+      return std::nullopt;
+    }
+    unsigned result_number = mlir::cast<OpResult>(base).getResultNumber();
+    if (Value unwrapped = UnwrapPassThroughBufferOp(def, result_number)) {
+      base = unwrapped;
+    } else if (auto scf_if = mlir::dyn_cast<scf::IfOp>(def)) {
+      if (branch_depth >= 8 || scf_if.getThenRegion().empty() ||
+          scf_if.getElseRegion().empty()) {
+        return std::nullopt;
+      }
+      Value then_val =
+          scf_if.getThenRegion().front().getTerminator()->getOperand(
+              result_number);
+      Value else_val =
+          scf_if.getElseRegion().front().getTerminator()->getOperand(
+              result_number);
+      if (then_val == else_val) {
+        base = then_val;
+        continue;
+      }
+      std::optional<uint64_t> then_align =
+          GetBaseBufferAlignment(then_val, element_type, op, branch_depth + 1);
+      std::optional<uint64_t> else_align =
+          GetBaseBufferAlignment(else_val, element_type, op, branch_depth + 1);
+      if (!then_align || !else_align) {
+        return std::nullopt;
+      }
+      return std::gcd(*then_align, *else_align);
+    } else if (mlir::isa<gpu::AllocateSharedOp>(def)) {
+      return get_shared_mem_alignment();
+    } else if (auto addr_cast = mlir::dyn_cast<ml::AddrSpaceCastOp>(def)) {
+      base = addr_cast.getArg();
+    } else if (auto addr_of = mlir::dyn_cast<ml::AddressOfOp>(def)) {
+      if (addr_of.getRes().getType().getAddressSpace() ==
+          kGPUSharedMemoryAddrSpace) {
+        return get_shared_mem_alignment();
+      }
+      return std::nullopt;
+    } else if (auto cast = mlir::dyn_cast<UnrealizedConversionCastOp>(def)) {
+      if (cast.getNumOperands() != 1) {
+        return std::nullopt;
+      }
+      base = cast.getOperand(0);
+    } else {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+// Returns the product of known divisors `lhs` and `rhs` (where `0` denotes an
+// identically-zero value). On 64-bit unsigned overflow, falls back to the
+// largest power-of-two divisor of the exact product (`2^min(62,
+// ctz(lhs)+ctz(rhs))`), preserving power-of-two alignment information safely.
+uint64_t MultiplyDivisors(uint64_t lhs, uint64_t rhs) {
+  if (lhs == 0 || rhs == 0) {
+    return 0;
+  }
+  if (lhs > std::numeric_limits<uint64_t>::max() / rhs) {
+    unsigned trailing_zeros =
+        std::min<unsigned>(62, absl::countr_zero(lhs) + absl::countr_zero(rhs));
+    return uint64_t{1} << trailing_zeros;
+  }
+  return lhs * rhs;
+}
+
+// Returns the largest power-of-two factor dividing a non-zero `value`.
+uint64_t LargestPowerOfTwoDivisor(uint64_t value) {
+  DCHECK_GT(value, 0);
+  return uint64_t{1} << absl::countr_zero(value);
+}
+
+// Returns a known divisor of `expr` given known divisors of its variables,
+// using `0` to represent an expression known to be identically zero.
+uint64_t GetExprKnownDivisor(SymbolicExpr expr,
+                             absl::Span<const uint64_t> var_divisors) {
+  if (!expr) {
+    return 1;
+  }
+  switch (expr.GetType()) {
+    case SymbolicExprType::kConstant: {
+      int64_t constant_val = expr.GetValue();
+      if (constant_val == 0) {
+        return 0;
+      }
+      return constant_val < 0
+                 ? (uint64_t{0} - static_cast<uint64_t>(constant_val))
+                 : static_cast<uint64_t>(constant_val);
+    }
+    case SymbolicExprType::kVariable: {
+      int64_t variable_id = expr.GetValue();
+      if (variable_id < 0 ||
+          static_cast<size_t>(variable_id) >= var_divisors.size()) {
+        return 1;
+      }
+      return var_divisors[variable_id];
+    }
+    case SymbolicExprType::kAdd:
+    case SymbolicExprType::kMin:
+    case SymbolicExprType::kMax: {
+      uint64_t lhs = GetExprKnownDivisor(expr.GetLHS(), var_divisors);
+      uint64_t rhs = GetExprKnownDivisor(expr.GetRHS(), var_divisors);
+      return std::gcd(lhs, rhs);
+    }
+    case SymbolicExprType::kMod: {
+      uint64_t lhs = GetExprKnownDivisor(expr.GetLHS(), var_divisors);
+      if (lhs == 0) {
+        return 0;
+      }
+      uint64_t rhs = GetExprKnownDivisor(expr.GetRHS(), var_divisors);
+      if (rhs == 0) {
+        return 1;
+      }
+      return std::gcd(lhs, rhs);
+    }
+    case SymbolicExprType::kMul: {
+      return MultiplyDivisors(GetExprKnownDivisor(expr.GetLHS(), var_divisors),
+                              GetExprKnownDivisor(expr.GetRHS(), var_divisors));
+    }
+    case SymbolicExprType::kFloorDiv:
+    case SymbolicExprType::kCeilDiv: {
+      if (expr.GetRHS().GetType() == SymbolicExprType::kConstant &&
+          expr.GetRHS().GetValue() > 0) {
+        uint64_t divisor = static_cast<uint64_t>(expr.GetRHS().GetValue());
+        uint64_t lhs = GetExprKnownDivisor(expr.GetLHS(), var_divisors);
+        if (lhs == 0) {
+          return 0;
+        }
+        if (lhs % divisor == 0) {
+          return lhs / divisor;
+        }
+      }
+      return 1;
+    }
+  }
+  return 1;
+}
+
+// Returns a known divisor of an index SSA value (`0` if identically zero).
+uint64_t GetIndexKnownDivisor(Value index_value, int depth = 0) {
+  if (!index_value || depth > 32) {
+    return 1;
+  }
+  llvm::APInt const_val;
+  if (mlir::matchPattern(index_value, mlir::m_ConstantInt(&const_val))) {
+    if (const_val.isZero()) {
+      return 0;
+    }
+    llvm::APInt abs_val = const_val.isNegative() ? -const_val : const_val;
+    if (abs_val.getActiveBits() <= 64) {
+      return abs_val.getZExtValue();
+    }
+    return uint64_t{1} << std::min<unsigned>(62, const_val.countr_zero());
+  }
+  if (auto block_arg = mlir::dyn_cast<mlir::BlockArgument>(index_value)) {
+    if (auto scf_for = mlir::dyn_cast_or_null<scf::ForOp>(
+            block_arg.getOwner()->getParentOp())) {
+      if (block_arg == scf_for.getInductionVar()) {
+        return std::gcd(
+            GetIndexKnownDivisor(scf_for.getLowerBound(), depth + 1),
+            GetIndexKnownDivisor(scf_for.getStep(), depth + 1));
+      }
+    }
+    return 1;
+  }
+  Operation* def = index_value.getDefiningOp();
+  if (!def) {
+    return 1;
+  }
+  if (auto apply = mlir::dyn_cast<ApplyIndexingOp>(def)) {
+    unsigned res_idx = mlir::cast<OpResult>(index_value).getResultNumber();
+    SmallVector<uint64_t, 8> var_divisors;
+    var_divisors.reserve(apply.getNumOperands());
+    for (Value operand : apply.getOperands()) {
+      var_divisors.push_back(GetIndexKnownDivisor(operand, depth + 1));
+    }
+    return GetExprKnownDivisor(apply.getSymbolicMap().GetResult(res_idx),
+                               var_divisors);
+  }
+  if (auto add = mlir::dyn_cast<arith::AddIOp>(def)) {
+    return std::gcd(GetIndexKnownDivisor(add.getLhs(), depth + 1),
+                    GetIndexKnownDivisor(add.getRhs(), depth + 1));
+  }
+  if (auto mul = mlir::dyn_cast<arith::MulIOp>(def)) {
+    return MultiplyDivisors(GetIndexKnownDivisor(mul.getLhs(), depth + 1),
+                            GetIndexKnownDivisor(mul.getRhs(), depth + 1));
+  }
+  if (auto shl = mlir::dyn_cast<arith::ShLIOp>(def)) {
+    llvm::APInt shift;
+    if (mlir::matchPattern(shl.getRhs(), mlir::m_ConstantInt(&shift)) &&
+        shift.ult(63)) {
+      return MultiplyDivisors(GetIndexKnownDivisor(shl.getLhs(), depth + 1),
+                              uint64_t{1} << shift.getZExtValue());
+    }
+  }
+  return 1;
+}
+
+std::optional<uint64_t> GetTransferAlignment(Value base, ValueRange indices,
+                                             Type element_type, Operation* op) {
+  CHECK_LE(indices.size(), 1) << "Only 0D and 1D tensors are supported";
+  std::optional<uint64_t> base_align =
+      GetBaseBufferAlignment(base, element_type, op);
+  if (!base_align || *base_align == 0) {
+    return std::nullopt;
+  }
+  uint64_t base_byte_align = std::min<uint64_t>(
+      LargestPowerOfTwoDivisor(*base_align), uint64_t{1} << 30);
+  uint64_t elem_div = indices.empty() ? 0 : GetIndexKnownDivisor(indices[0]);
+  if (elem_div == 0) {
+    return base_byte_align;
+  }
+
+  uint64_t elem_bits = 0;
+  if (std::optional<int> sub_byte_width = GetSubByteBitWidth(element_type)) {
+    elem_bits = static_cast<uint64_t>(*sub_byte_width);
+  } else {
+    mlir::LLVMTypeConverter converter(op->getContext());
+    Type llvm_elem_type = converter.convertType(element_type);
+    llvm::TypeSize alloc_size =
+        mlir::DataLayout::closest(op).getTypeAllocSize(llvm_elem_type);
+    if (alloc_size.isScalable()) {
+      return std::nullopt;
+    }
+    elem_bits = alloc_size.getFixedValue() * 8;
+  }
+  if (elem_bits == 0) {
+    return std::nullopt;
+  }
+
+  uint64_t bit_offset_div = MultiplyDivisors(elem_div, elem_bits);
+  uint64_t bit_align = std::gcd(base_byte_align * 8, bit_offset_div);
+  if (bit_align < 8) {
+    return uint64_t{1};
+  }
+  uint64_t byte_align = bit_align / 8;
+  return LargestPowerOfTwoDivisor(byte_align);
+}
+
 // Get the number of bits used to index into a sub-byte type.
 int SubByteIndexingBits(int bit_width) {
   CHECK_LT(bit_width, 8) << "Passed width is not a sub-byte";
@@ -477,8 +756,17 @@ struct RewriteTransferRead : OpRewritePattern<vector::TransferReadOp> {
 
     mlir::LLVMTypeConverter converter(b.getContext());
     auto llvm_vector_type = converter.convertType(vector_type);
-    auto load = ml::LoadOp::create(b, llvm_vector_type, gep);
-    if (auto alignment = GetAlignmentFromArg(op.getBase(), op.getIndices())) {
+    Type load_type = llvm_vector_type;
+    if (sub_byte_width && !vector_type.isScalable()) {
+      int64_t total_bits = vector_type.getNumElements() * (*sub_byte_width);
+      if (total_bits >= 8 && total_bits <= 128 &&
+          absl::has_single_bit(static_cast<uint64_t>(total_bits))) {
+        load_type = b.getIntegerType(total_bits);
+      }
+    }
+    auto load = ml::LoadOp::create(b, load_type, gep);
+    if (std::optional<uint64_t> alignment = GetTransferAlignment(
+            op.getBase(), op.getIndices(), gep_element_type, op)) {
       load.setAlignment(*alignment);
     } else {
       auto data_layout = mlir::DataLayout::closest(op);
@@ -489,8 +777,12 @@ struct RewriteTransferRead : OpRewritePattern<vector::TransferReadOp> {
           data_layout.getTypePreferredAlignment(gep_element_type));
     }
 
+    Value loaded = load.getResult();
+    if (load_type != llvm_vector_type) {
+      loaded = ml::BitcastOp::create(b, llvm_vector_type, loaded);
+    }
     rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(op, op.getType(),
-                                                            load.getResult());
+                                                            loaded);
     return success();
   }
 };
@@ -634,7 +926,8 @@ struct RewriteTransferWrite : OpRewritePattern<vector::TransferWriteOp> {
     auto linear_index = GetLinearIndex(op.getIndices(), b);
 
     mlir::Value vector_value = op.getVector();
-    mlir::Type vector_element_type = op.getVectorType().getElementType();
+    mlir::VectorType vector_type = op.getVectorType();
+    mlir::Type vector_element_type = vector_type.getElementType();
     std::optional<int> sub_byte_width = GetSubByteBitWidth(vector_element_type);
     if (sub_byte_width) {
       linear_index = arith::ShRUIOp::create(
@@ -649,8 +942,17 @@ struct RewriteTransferWrite : OpRewritePattern<vector::TransferWriteOp> {
     vector_value =
         UnrealizedConversionCastOp::create(b, llvm_type, vector_value)
             .getResult(0);
+    if (sub_byte_width && !vector_type.isScalable()) {
+      int64_t total_bits = vector_type.getNumElements() * (*sub_byte_width);
+      if (total_bits >= 8 && total_bits <= 128 &&
+          absl::has_single_bit(static_cast<uint64_t>(total_bits))) {
+        vector_value = ml::BitcastOp::create(b, b.getIntegerType(total_bits),
+                                             vector_value);
+      }
+    }
     auto store = ml::StoreOp::create(b, vector_value, gep);
-    if (auto alignment = GetAlignmentFromArg(op.getBase(), op.getIndices())) {
+    if (std::optional<uint64_t> alignment = GetTransferAlignment(
+            dest, op.getIndices(), vector_element_type, op)) {
       store.setAlignment(*alignment);
     } else {
       auto data_layout = mlir::DataLayout::closest(op);
@@ -888,7 +1190,6 @@ struct RewriteAllocateShared : OpRewritePattern<gpu::AllocateSharedOp> {
       mlir::PatternRewriter& rewriter) const override {
     auto module = op->getParentOfType<mlir::ModuleOp>();
     auto shaped_ty = mlir::cast<mlir::ShapedType>(op.getResult().getType());
-    constexpr int kGPUSharedMemoryAddrSpace = 3;
     mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
 
     auto global =

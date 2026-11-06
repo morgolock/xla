@@ -18,6 +18,8 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -67,13 +69,20 @@ constexpr absl::string_view kGemmBackendConfig =
 
 class MockExecutable : public Executable {
  public:
-  explicit MockExecutable(std::shared_ptr<HloModule> module, int duration_ns,
-                          bool should_fail = false,
+  explicit MockExecutable(std::shared_ptr<HloModule> module,
+                          int64_t duration_ns, bool should_fail = false,
                           bool write_past_allocated_buffer = false)
-      : Executable(module),
-        duration_ns_(duration_ns),
+      : MockExecutable(std::move(module), std::vector<int64_t>{duration_ns},
+                       should_fail, write_past_allocated_buffer) {}
+
+  MockExecutable(std::shared_ptr<HloModule> module,
+                 std::vector<int64_t> durations_ns, bool should_fail = false,
+                 bool write_past_allocated_buffer = false)
+      : Executable(std::move(module)),
+        durations_ns_(std::move(durations_ns)),
         should_fail_(should_fail),
         write_past_allocated_buffer_(write_past_allocated_buffer) {}
+
   absl::StatusOr<ExecutionOutput> ExecuteAsyncOnStream(
       const ServiceExecutableRunOptions* run_options,
       std::vector<ExecutionInput> arguments) override {
@@ -82,7 +91,13 @@ class MockExecutable : public Executable {
     }
     ExecutionProfile* profile = run_options->run_options().execution_profile();
     if (profile != nullptr) {
-      profile->set_compute_time_ns(duration_ns_);
+      int64_t duration_ns =
+          durations_ns_.empty()
+              ? 0
+              : durations_ns_[std::min<size_t>(num_profiled_runs_,
+                                               durations_ns_.size() - 1)];
+      ++num_profiled_runs_;
+      profile->set_compute_time_ns(duration_ns);
     }
     if (write_past_allocated_buffer_) {
       ABSL_RETURN_IF_ERROR(WriteOutOfBounds(*run_options));
@@ -93,6 +108,8 @@ class MockExecutable : public Executable {
                            run_options->run_options().allocator(),
                            run_options->run_options().device_ordinal());
   }
+
+  int num_profiled_runs() const { return num_profiled_runs_; }
 
  private:
   // Simulates a kernel that writes past the end of an allocated buffer:
@@ -118,7 +135,8 @@ class MockExecutable : public Executable {
                                                        kOverrunBytes);
   }
 
-  int duration_ns_;
+  std::vector<int64_t> durations_ns_;
+  int num_profiled_runs_ = 0;
   bool should_fail_;
   bool write_past_allocated_buffer_;
 };
@@ -218,6 +236,68 @@ TEST_F(GpuProfilerTest, CreateInputBuffersAndProfile) {
   EXPECT_EQ(profile.output_buffer->on_device_shape(),
             ShapeUtil::MakeShape(S32, {}));
   EXPECT_EQ(profile.scratch_bytes, 0);
+  EXPECT_EQ(mock_executable.num_profiled_runs(), 9);
+}
+
+TEST_F(GpuProfilerTest, ProfileShortKernelRepeatsAndUsesMedian) {
+  constexpr absl::string_view kHloModule = R"hlo(
+    HloModule module
+    ENTRY main {
+      ROOT c = s32[] constant(1)
+    }
+  )hlo";
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHloModule));
+  MockExecutable mock_executable(
+      module, {18000, 5800, 5900, 5850, 6000, 5820, 5880, 5910, 5860});
+  auto profiler =
+      GpuProfiler::Create(stream_exec_, ProfileOptions(), allocator_.get());
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<InputBuffers> buffers,
+                       profiler->CreateInputBuffers(&mock_executable));
+  ASSERT_OK_AND_ASSIGN(ProfileResult profile,
+                       profiler->Profile(&mock_executable, *buffers));
+  EXPECT_EQ(mock_executable.num_profiled_runs(), 9);
+  EXPECT_EQ(profile.duration, absl::Nanoseconds(5880));
+}
+
+TEST_F(GpuProfilerTest, ProfileLongKernelRunsOnce) {
+  constexpr absl::string_view kHloModule = R"hlo(
+    HloModule module
+    ENTRY main {
+      ROOT c = s32[] constant(1)
+    }
+  )hlo";
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHloModule));
+  MockExecutable mock_executable(module, 25000);
+  auto profiler =
+      GpuProfiler::Create(stream_exec_, ProfileOptions(), allocator_.get());
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<InputBuffers> buffers,
+                       profiler->CreateInputBuffers(&mock_executable));
+  ASSERT_OK_AND_ASSIGN(ProfileResult profile,
+                       profiler->Profile(&mock_executable, *buffers));
+  EXPECT_EQ(mock_executable.num_profiled_runs(), 1);
+  EXPECT_EQ(profile.duration, absl::Nanoseconds(25000));
+}
+
+TEST_F(GpuProfilerTest, ProfileZeroDurationKernelRunsOnce) {
+  constexpr absl::string_view kHloModule = R"hlo(
+    HloModule module
+    ENTRY main {
+      ROOT c = s32[] constant(1)
+    }
+  )hlo";
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHloModule));
+  MockExecutable mock_executable(module, 0);
+  auto profiler =
+      GpuProfiler::Create(stream_exec_, ProfileOptions(), allocator_.get());
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<InputBuffers> buffers,
+                       profiler->CreateInputBuffers(&mock_executable));
+  ASSERT_OK_AND_ASSIGN(ProfileResult profile,
+                       profiler->Profile(&mock_executable, *buffers));
+  EXPECT_EQ(mock_executable.num_profiled_runs(), 1);
+  EXPECT_EQ(profile.duration, absl::Nanoseconds(0));
 }
 
 TEST_F(GpuProfilerTest, RejectsCandidateThatWritesPastAllocatedBuffer) {

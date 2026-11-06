@@ -9,3 +9,5 @@ fusion {
 // CHECK: #indexing_map{{.*}}domain:{{.*}}th_x in [0, [[N_THREADS:[0-9]+]]]
 // CHECK: %thread_id_x = gpu.thread_id  x {xla.range = [0 : index, [[N_THREADS]] : index]}
 // CHECK:  xla_gpu.allocate_shared : tensor<128x128xi8>
+// CHECK: vector.bitcast {{.*}} : vector<4xi8> to vector<1xi32>
+// CHECK: vector.bitcast {{.*}} : vector<1xi32> to vector<4xi8>

@@ -173,5 +173,36 @@ TEST(StackFrameIndexBuilderTest, FusedLocSkipsSubLocationsWithoutFrames) {
   EXPECT_EQ(names, expected);
 }
 
+TEST(StackFrameIndexBuilderTest, SharedSubLocationsAreNotExpanded) {
+  MLIRContext ctx;
+  // Locations are uniqued, so every CallSiteLoc below shares its callee and its
+  // caller: 64 nested locations that expand to a call stack of 2^64 frames.
+  Location loc = MakeFrameLoc(&ctx, "A", "a.py", 1);
+  for (int i = 0; i < 64; ++i) {
+    loc = CallSiteLoc::get(loc, loc);
+  }
+
+  StackFrameIndexBuilder builder;
+  auto result = builder.AddCallStackAndGetFirstFrameId(loc);
+  auto proto = builder.Build();
+
+  EXPECT_NE(result.last_frame_id, StackFrameIndexBuilder::kInvalidIndex);
+  EXPECT_LT(proto.stack_frames_size(), 1 << 20);
+}
+
+TEST(StackFrameIndexBuilderTest, SharedFramelessSubLocationsAreNotExpanded) {
+  MLIRContext ctx;
+  // Same as above, but no location holds a frame.
+  Location loc = FileLineColLoc::get(StringAttr::get(&ctx, "a.py"), 1, 0);
+  for (int i = 0; i < 64; ++i) {
+    loc = CallSiteLoc::get(loc, loc);
+  }
+
+  StackFrameIndexBuilder builder;
+  auto result = builder.AddCallStackAndGetFirstFrameId(loc);
+
+  EXPECT_EQ(result.last_frame_id, StackFrameIndexBuilder::kInvalidIndex);
+}
+
 }  // namespace
 }  // namespace mlir

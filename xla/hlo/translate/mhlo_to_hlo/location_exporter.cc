@@ -36,17 +36,26 @@ namespace mlir {
 namespace mhlo {
 namespace {
 
+// MLIR uniques locations, so nested locations can share sub-locations and form
+// a DAG whose expansion into a tree is exponentially larger than the module
+// that encodes it. The traversals below expand the location they are given, so
+// each of them visits at most this many (not necessarily distinct) locations
+// and ignores the rest. Locations emitted by frontends are far smaller.
+constexpr int kMaxVisitedLocations = 4096;
+
 bool IsFrameNameLocation(mlir::Location location);
 
 // Extracts the `;`-separated op name(s) from `loc`. When `is_caller` is true
 // (on the caller side of a `CallSiteLoc`), only explicit op names from inlined
-// call sites are extracted, ignoring source stack frames.
-std::string GetNameFromLocImpl(Location loc, bool is_caller = false) {
+// call sites are extracted, ignoring source stack frames. `budget` is the
+// number of locations that may still be visited.
+std::string GetNameFromLocImpl(Location loc, bool is_caller, int& budget) {
   llvm::SmallVector<std::string, 8> loc_names;
   llvm::SmallVector<Location, 8> locs;
   locs.push_back(loc);
 
-  while (!locs.empty()) {
+  while (!locs.empty() && budget > 0) {
+    --budget;
     Location curr_loc = locs.pop_back_val();
 
     if (auto name_loc = mlir::dyn_cast<NameLoc>(curr_loc)) {
@@ -65,8 +74,9 @@ std::string GetNameFromLocImpl(Location loc, bool is_caller = false) {
     } else if (auto call_loc = mlir::dyn_cast<CallSiteLoc>(curr_loc)) {
       // Combine caller and callee op names (ignoring bare caller stack frames).
       std::string caller =
-          GetNameFromLocImpl(call_loc.getCaller(), /*is_caller=*/true);
-      std::string callee = GetNameFromLocImpl(call_loc.getCallee(), is_caller);
+          GetNameFromLocImpl(call_loc.getCaller(), /*is_caller=*/true, budget);
+      std::string callee =
+          GetNameFromLocImpl(call_loc.getCallee(), is_caller, budget);
       if (!caller.empty() && !callee.empty()) {
         loc_names.push_back(absl::StrCat(caller, "/", callee));
       } else if (!callee.empty()) {
@@ -117,7 +127,13 @@ static std::string GetOpTypeFromLoc(Location loc) {
   return llvm::join(loc_op_types.begin(), loc_op_types.end(), ";");
 }
 
-static void SetSourceFileAndLine(Location loc, xla::OpMetadata& metadata) {
+// `budget` is the number of locations that may still be visited.
+static void SetSourceFileAndLine(Location loc, xla::OpMetadata& metadata,
+                                 int& budget) {
+  if (budget <= 0) {
+    return;
+  }
+  --budget;
   if (auto file_line_col_loc = mlir::dyn_cast<mlir::FileLineColLoc>(loc)) {
     metadata.set_source_file(file_line_col_loc.getFilename().str());
     metadata.set_source_line(file_line_col_loc.getLine());
@@ -126,7 +142,7 @@ static void SetSourceFileAndLine(Location loc, xla::OpMetadata& metadata) {
     metadata.set_source_end_column(file_line_col_loc.getEndColumn());
   } else if (auto fused_loc = mlir::dyn_cast<FusedLoc>(loc)) {
     for (Location it : fused_loc.getLocations()) {
-      SetSourceFileAndLine(it, metadata);
+      SetSourceFileAndLine(it, metadata, budget);
     }
   }
 }
@@ -145,7 +161,8 @@ xla::OpMetadata CreateOpMetadataFromLocation(
     return metadata;
   }
 
-  std::string name = GetNameFromLocImpl(loc);
+  int name_budget = kMaxVisitedLocations;
+  std::string name = GetNameFromLocImpl(loc, /*is_caller=*/false, name_budget);
   metadata.set_op_name(name);
   std::string op_type = GetOpTypeFromLoc(loc);
   metadata.set_op_type(op_type);
@@ -181,12 +198,14 @@ xla::OpMetadata CreateOpMetadataFromLocation(
     }
   }
 
-  SetSourceFileAndLine(loc, metadata);
+  int source_budget = kMaxVisitedLocations;
+  SetSourceFileAndLine(loc, metadata, source_budget);
   return metadata;
 }
 
 std::string GetDebugNameFromLocation(mlir::Location loc) {
-  return GetNameFromLocImpl(loc);
+  int budget = kMaxVisitedLocations;
+  return GetNameFromLocImpl(loc, /*is_caller=*/false, budget);
 }
 
 }  // namespace mhlo

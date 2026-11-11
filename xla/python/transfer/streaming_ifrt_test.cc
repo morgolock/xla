@@ -45,8 +45,10 @@ limitations under the License.
 #include "xla/python/pjrt_ifrt/pjrt_device.h"
 #include "xla/python/transfer/streaming.h"
 #include "xla/python/transfer/test_pattern.h"
+#include "xla/python/transfer/transfer_socket.pb.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/concurrency/ref_count.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/env.h"
@@ -282,6 +284,114 @@ TEST(PremappedCopierState, PoisonSlicedRaw) {
                           CreateSlicedRawBufferDest(dest_raw_buffer, 0, 4096));
   fut_and_dest.first->Poison(absl::InternalError("Poisoning."));
   ASSERT_FALSE(fut_and_dest.second.Await().ok());
+}
+
+constexpr int kNumRacers = 2;
+
+// Outcome of the pulls issued by racing PullTable::Entry::Handle() calls.
+struct RaceResults {
+  absl::Mutex mu;
+  int num_parked = 0;
+  int num_sent = 0;
+  int num_errors = 0;
+};
+
+// Parks the first kNumRacers SendError() calls until all of them have arrived,
+// which lines up racing Handle() calls right before their next buffer id.
+class RacingConnectionState : public ConnectionState {
+ public:
+  explicit RacingConnectionState(std::shared_ptr<RaceResults> results)
+      : results_(std::move(results)) {}
+
+  void Send(size_t req_id, const void* data, size_t offset, size_t size,
+            bool is_largest, absl::AnyInvocable<void() &&> on_done) override {
+    std::move(on_done)();
+    absl::MutexLock l(results_->mu);
+    ++results_->num_sent;
+  }
+
+  void SendError(size_t req_id, size_t offset, size_t size, bool is_largest,
+                 absl::Status status) override {
+    absl::MutexLock l(results_->mu);
+    if (results_->num_parked < kNumRacers) {
+      ++results_->num_parked;
+      results_->mu.Await(absl::Condition(
+          +[](RaceResults* r) { return r->num_parked == kNumRacers; },
+          results_.get()));
+      return;
+    }
+    ++results_->num_errors;
+  }
+
+ private:
+  std::shared_ptr<RaceResults> results_;
+};
+
+// Pulls buffer 0 of `entry` from kNumRacers threads at once and expects exactly
+// one of them to get it. `ready_promise` gates the readiness of that buffer.
+void ExpectBufferFetchedOnce(tsl::RCReference<PullTable::Entry> entry,
+                             tsl::Promise<> ready_promise) {
+  SocketTransferPullRequest req;
+  req.add_buffer_ids(1);  // Out of range, so that Handle() calls SendError().
+  req.add_buffer_ids(0);
+  auto results = std::make_shared<RaceResults>();
+  {
+    std::vector<std::unique_ptr<tsl::Thread>> racers;
+    for (int i = 0; i < kNumRacers; ++i) {
+      racers.emplace_back(
+          tsl::Env::Default()->StartThread({}, "racer", [&, i]() {
+            entry->Handle(tsl::MakeRef<RacingConnectionState>(results), req,
+                          i * req.buffer_ids_size());
+          }));
+    }
+  }
+  ready_promise.Set();
+  absl::MutexLock l(results->mu);
+  results->mu.Await(absl::Condition(
+      +[](RaceResults* r) { return r->num_sent + r->num_errors == kNumRacers; },
+      results.get()));
+  EXPECT_EQ(results->num_sent, 1);
+  EXPECT_EQ(results->num_errors, kNumRacers - 1);
+}
+
+TEST(PullTableEntry, ConcurrentHandleFetchesBufferOnce) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client, xla::ifrt::test_util::GetClient());
+  std::shared_ptr<xla::PjRtClient> pjrt_client =
+      absl::down_cast<xla::ifrt::PjRtClient*>(client.get())
+          ->shared_ptr_pjrt_client();
+  size_t xfer_size = 1024 * 1024;
+  TF_ASSERT_OK_AND_ASSIGN(auto scratch,
+                          AllocateAndMapPjrtMemory(pjrt_client, 4 * xfer_size));
+  auto cstate = std::make_shared<PremappedCopierState>(scratch, 4, xfer_size);
+  TF_ASSERT_OK_AND_ASSIGN(auto arr, tests::CopyTestPatternToDevice(
+                                        client.get(), client->devices()[0],
+                                        tests::CreateTestPattern(0, 1024)));
+  TF_ASSERT_OK(arr->GetReadyFuture().Await());
+  std::shared_ptr<xla::PjRtBuffer> buffer =
+      static_cast<xla::ifrt::PjRtCompatibleArray*>(arr.get())
+          ->pjrt_buffers()[0];
+  TF_ASSERT_OK_AND_ASSIGN(size_t buf_size, buffer->GetOnDeviceSizeInBytes());
+  {
+    SCOPED_TRACE("PjRtBufferEntry");
+    auto [promise, future] = tsl::MakePromise<>();
+    std::vector<PjRtBufferEntry::BufferRef> refs;
+    refs.push_back({buffer, buf_size, std::move(future)});
+    ExpectBufferFetchedOnce(
+        tsl::MakeRef<PjRtBufferEntry>(std::move(refs), cstate, xfer_size),
+        std::move(promise));
+  }
+  {
+    SCOPED_TRACE("RawBufferEntry");
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto raw_buffer,
+        xla::PjRtRawBuffer::CreateRawAliasOfBuffer(buffer.get()));
+    auto [promise, future] = tsl::MakePromise<>();
+    std::vector<RawBufferEntry::BufferRef> refs;
+    refs.push_back({std::move(future), std::move(raw_buffer), buf_size});
+    ExpectBufferFetchedOnce(
+        tsl::MakeRef<RawBufferEntry>(std::move(refs), cstate, xfer_size),
+        std::move(promise));
+  }
 }
 
 TEST(Semaphore, Basic) {

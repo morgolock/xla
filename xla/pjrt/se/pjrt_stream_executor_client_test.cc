@@ -193,13 +193,25 @@ MakeTestPjRtStreamExecutorClient(
       break;
     }
   }
+  auto platform_id = tsl::Fingerprint64(platform_name);
+  absl::flat_hash_map<GlobalDeviceId, ProcessId> device_to_process;
+  absl::flat_hash_map<int32_t, int32_t> num_devices_per_slice;
+  device_to_process.reserve(devices.size());
+  for (const auto& device : devices) {
+    device_to_process[device->global_device_id()] =
+        ProcessId(device->process_index());
+    ++num_devices_per_slice[0];
+  }
+  auto multi_slice_config = tsl::MakeRef<GpuMultiSliceConfig>(
+      /*num_slices=*/num_devices_per_slice.size(), /*slice_id=*/0,
+      std::move(num_devices_per_slice), std::move(device_to_process));
   auto raw_client = std::make_unique<PjRtStreamExecutorRawClient>(
-      std::move(local_device_states), std::move(allocator), client,
+      platform_id, std::move(local_device_states), std::move(allocator), client,
       std::move(host_memory_allocator), should_stage_host_to_device_transfers,
       MakeUnboundedAsyncWorkRunner("pjrt_async_work_runner",
                                    {/*stack_size=*/512 * 1024}),
-      first_executor, std::move(gpu_run_options));
-  auto platform_id = tsl::Fingerprint64(platform_name);
+      first_executor, std::move(gpu_run_options),
+      /*confidential_computing_enabled=*/false, std::move(multi_slice_config));
   PjRtPluginAttributes attrs;
   attrs.pjrt_c_api_major_version = 0;
   attrs.pjrt_c_api_minor_version = 0;
@@ -776,7 +788,8 @@ TEST(PjRtStreamExecutorClientTest,
       /*use_callback_stream=*/false, /*device_ordinal=*/kVirtualDeviceId));
 
   PjRtStreamExecutorRawClient raw_client(
-      std::move(local_device_states), /*allocator=*/nullptr, local_client,
+      tsl::Fingerprint64("cpu"), std::move(local_device_states),
+      /*allocator=*/nullptr, local_client,
       /*host_memory_allocator=*/nullptr,
       /*should_stage_host_to_device_transfers=*/false,
       MakeUnboundedAsyncWorkRunner("pjrt_async_work_runner",

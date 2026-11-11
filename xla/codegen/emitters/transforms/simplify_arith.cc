@@ -340,14 +340,16 @@ static std::optional<Interval> GetSelectRange(mlir::Operation* sel) {
   Interval result{0,
                   static_cast<int64_t>(
                       (1ull << (x.getType().getIntOrFloatBitWidth() - 1)) - 1)};
+  // This only holds if x cannot be the minimum signed value, for which `0 - x`
+  // wraps around to x itself.
   std::optional<Interval> x_range = GetRange(x);
-  if (x_range.has_value()) {
-    Interval positive_range = x_range->max({0, 0});
-    Interval negative_range = -x_range->min({0, 0});
-    Interval abs_range = positive_range.Union(negative_range);
-    return result.Intersect(abs_range);
+  if (!x_range.has_value() || x_range->lower < -result.upper) {
+    return std::nullopt;
   }
-  return result;
+  Interval positive_range = x_range->max({0, 0});
+  Interval negative_range = -x_range->min({0, 0});
+  Interval abs_range = positive_range.Union(negative_range);
+  return result.Intersect(abs_range);
 }
 
 void AnnotateRanges(mlir::func::FuncOp func) {

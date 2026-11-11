@@ -2504,6 +2504,15 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
                    ShapeUtil::HumanString(operands[0]->shape())));
         return nullptr;
       }
+      if (inferred_dimension.has_value() && *inferred_dimension != -1 &&
+          (*inferred_dimension < 0 ||
+           *inferred_dimension >= shape->dimensions().size())) {
+        TokenError(StrCat(
+            "expects inferred_dimension to be -1 or a dimension "
+            "of result shape ",
+            ShapeUtil::HumanString(*shape), ", got ", *inferred_dimension));
+        return nullptr;
+      }
       return builder->AddInstruction(HloInstruction::CreateReshape(
           *shape, operands[0], inferred_dimension.value_or(-1)));
     }

@@ -5302,6 +5302,24 @@ ENTRY %test_entry {
                         "f32[31] and operand shape f32[4,8]"));
 }
 
+TEST_F(HloParserTest, ParseReshapeInferredDimensionOutOfRange) {
+  for (const char* inferred_dimension : {"3", "-2"}) {
+    const std::string original = absl::StrCat(R"(
+HloModule test_module
+ENTRY %test_entry {
+  %a = f32[<=6,4] parameter(0)
+  ROOT %result = f32[<=3,2,4] reshape(%a), inferred_dimension=)",
+                                              inferred_dimension, R"(
+}
+)");
+    auto status = ParseAndReturnUnverifiedModule(original).status();
+    EXPECT_FALSE(status.ok());
+    EXPECT_THAT(status.message(),
+                HasSubstr("expects inferred_dimension to be -1 or a dimension "
+                          "of result shape f32[<=3,2,4]"));
+  }
+}
+
 TEST_F(HloParserTest, ParseDynamicReshapeElementCountMismatch) {
   const std::string original = R"(
 HloModule test_module

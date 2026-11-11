@@ -3526,6 +3526,35 @@ TEST_F(HloInstructionTest, CreateFromProtoExp) {
               ::testing::HasSubstr("Negative tolerance"));
 }
 
+TEST_F(HloInstructionTest, CreateFromProtoReshapeInferredDimension) {
+  const Shape operand_shape = ShapeUtil::MakeShape(F32, {6, 4}, {true, false});
+  const Shape result_shape =
+      ShapeUtil::MakeShape(F32, {3, 2, 4}, {true, false, false});
+  auto param = HloInstruction::CreateParameter(0, operand_shape, "p0");
+  HloInstructionProto proto;
+  proto.set_opcode("reshape");
+  proto.set_name("reshape");
+  *proto.mutable_shape() = result_shape.ToProto();
+  proto.add_operand_ids(0);
+  proto.add_dimensions(0);
+  const absl::flat_hash_map<int64_t, HloInstruction*> instruction_map = {
+      {0, param.get()}};
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloInstruction> reshape,
+                       HloInstruction::CreateFromProto(proto, instruction_map));
+  EXPECT_EQ(reshape->inferred_dimension(), 0);
+
+  // An inferred dimension that is not a dimension of the result shape must be
+  // rejected, since it is later used to index into the result shape.
+  for (int64_t inferred_dimension : {int64_t{3}, int64_t{-2}}) {
+    proto.set_dimensions(0, inferred_dimension);
+    EXPECT_THAT(HloInstruction::CreateFromProto(proto, instruction_map)
+                    .status()
+                    .message(),
+                HasSubstr("is out of range for shape"));
+  }
+}
+
 TEST_F(HloInstructionTest, CreateFromProtoAsyncUpdateLateBinding) {
   HloComputation::Builder async_builder("async_comp");
   async_builder.AddInstruction(

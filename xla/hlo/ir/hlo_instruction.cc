@@ -1302,6 +1302,11 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
                         ShapeUtil::StaticExtentProduct(operands(0)->shape())))
           << "shape: " << ShapeUtil::HumanString(shape)
           << " operand: " << ShapeUtil::HumanString(operands(0)->shape());
+      TF_RET_CHECK(inferred_dimension == -1 ||
+                   (inferred_dimension >= 0 &&
+                    inferred_dimension < shape.dimensions().size()))
+          << "Reshape inferred_dimension " << inferred_dimension
+          << " is out of range for shape " << ShapeUtil::HumanString(shape);
       instruction = CreateReshape(shape, operands(0), inferred_dimension);
       break;
     }
